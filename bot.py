@@ -6,12 +6,12 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-# === НАСТРОЙКИ — БЕЗОПАСНО ИЗ ОКРУЖЕНИЯ ===
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
-CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
+# === НАСТРОЙКИ — БЕЗОПАСНО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")        # ← из Render/Railway/Heroku
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))  # ← ваш ID (число!)
+CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN") # ← от @CryptoBot
 
-# === 12 ВИДОВ РЕКЛАМЫ ===
+# === 12 ВИДОВ РЕКЛАМЫ С ЦЕНАМИ ===
 AD_PRICES = {
     "ad1": 10, "ad2": 15, "ad3": 8, "ad4": 12, "ad5": 20,
     "ad6": 25, "ad7": 18, "ad8": 14, "ad9": 16, "ad10": 11,
@@ -33,7 +33,7 @@ AD_TYPES = {
     "ad12": "Реклама в статусе"
 }
 
-# === БАЗА ДАННЫХ ===
+# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
 def init_db():
     conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
@@ -68,6 +68,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+# === СОХРАНЕНИЕ СООБЩЕНИЙ ===
 def save_message(user_id, username, first_name, message_type, content, ad_type=None, ad_price=None):
     conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
@@ -78,6 +79,7 @@ def save_message(user_id, username, first_name, message_type, content, ad_type=N
     conn.commit()
     conn.close()
 
+# === СОХРАНЕНИЕ ЗАКАЗОВ ===
 def save_order(user_id, username, ad_type, ad_name, amount, payment_url, invoice_id, payment_method):
     conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
@@ -88,29 +90,7 @@ def save_order(user_id, username, ad_type, ad_name, amount, payment_url, invoice
     conn.commit()
     conn.close()
 
-def get_user_history(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT message_type, content, ad_type, ad_price, timestamp
-        FROM messages
-        WHERE user_id = ?
-        ORDER BY timestamp DESC
-    ''', (user_id,))
-    return cursor.fetchall()
-
-def get_user_orders(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT ad_name, amount, payment_method, status, timestamp
-        FROM orders
-        WHERE user_id = ?
-        ORDER BY timestamp DESC
-    ''', (user_id,))
-    return cursor.fetchall()
-
-# === КРИПТОБОТ ИНТЕГРАЦИЯ (исправлена) ===
+# === СОЗДАНИЕ ИНВОЙСА ЧЕРЕЗ CRYPTOBOT API ===
 def create_crypto_invoice(amount, description, user_id):
     url = "https://pay.crypt.bot/api/createInvoice"
     headers = {
@@ -128,15 +108,31 @@ def create_crypto_invoice(amount, description, user_id):
         response = requests.post(url, json=data, headers=headers, timeout=10)
         if response.status_code == 200:
             result = response.json()
-            if result.get('ok') and 'result' in result:
+            if result.get('ok') and 'result' in result and 'pay_url' in result['result']:
                 return result['result']['invoice_id'], result['result']['pay_url']
-        print(f"Ошибка API: {response.status_code} — {response.text}")
         return None, None
     except Exception as e:
-        print(f"Исключение при создании инвойса: {e}")
+        print(f"[ERROR] CryptoBot invoice failed: {e}")
         return None, None
 
-logging.basicConfig(level=logging.INFO)
+# === ПОЛУЧЕНИЕ ИСТОРИИ ПОЛЬЗОВАТЕЛЯ ===
+def get_user_history(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT message_type, content, ad_type, ad_price, timestamp 
+        FROM messages WHERE user_id = ? ORDER BY timestamp DESC
+    ''', (user_id,))
+    return cursor.fetchall()
+
+def get_user_orders(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT ad_name, amount, payment_method, status, timestamp 
+        FROM orders WHERE user_id = ? ORDER BY timestamp DESC
+    ''', (user_id,))
+    return cursor.fetchall()
 
 # === УНИВЕРСАЛЬНАЯ КНОПКА НАЗАД ===
 def back_button():
@@ -150,7 +146,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Моя история", callback_data='history')],
         [InlineKeyboardButton("🛒 Мои заказы", callback_data='orders')]
     ]
-    text = "🚀 Добро пожаловать! Выберите:"
+    text = "🚀 Привет! Выберите действие:"
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -189,7 +185,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ad_key = query.data.replace('admin_', '')
         ad_name = AD_TYPES[ad_key]
         await query.edit_message_text(
-            f"🎯 {ad_name}\nНапишите админу или отправьте сообщение в чат:",
+            f"🎯 Заказ: {ad_name}\nНапишите детали заказа:",
             reply_markup=InlineKeyboardMarkup(back_button())
         )
         context.user_data['mode'] = f'ad_order_{ad_key}'
@@ -198,7 +194,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ad_key = query.data.replace('crypto_', '')
         ad_name = AD_TYPES[ad_key]
         ad_price = AD_PRICES[ad_key]
-        invoice_id, payment_url = create_crypto_invoice(ad_price, f"Заказ: {ad_name}", user.id)
+        invoice_id, payment_url = create_crypto_invoice(ad_price, f"Реклама: {ad_name}", user.id)
         if invoice_id and payment_url:
             save_order(user.id, user.username or 'N/A', ad_key, ad_name, ad_price, payment_url, invoice_id, 'CryptoBot')
             await query.edit_message_text(
@@ -208,24 +204,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text(
-                "❌ Не удалось создать счёт. Напишите админу.",
+                "❌ Не удалось создать счёт.\nПроверьте токен CryptoBot или напишите админу.",
                 reply_markup=InlineKeyboardMarkup(back_button())
             )
 
     elif query.data == 'history':
         history = get_user_history(user.id)
-        msg = "📋 История сообщений:\n" + "\n".join([f"• {h[0]}: {h[1][-30:]}" for h in history[:5]]) if history else "Пусто"
+        msg = "📋 История сообщений:\n" + "\n".join([
+            f"• {h[0]}: {h[1][-30:]}" for h in history[:5]
+        ]) if history else "Пусто"
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(back_button()))
 
     elif query.data == 'orders':
         orders = get_user_orders(user.id)
-        msg = "🛒 Мои заказы:\n" + "\n".join([f"• {o[0]} — ${o[1]} ({o[2]})" for o in orders[:5]]) if orders else "Пусто"
+        msg = "🛒 Мои заказы:\n" + "\n".join([
+            f"• {o[0]} — ${o[1]} ({o[2]})" for o in orders[:5]
+        ]) if orders else "Пусто"
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(back_button()))
 
     elif query.data == 'back_to_main':
         await start(query, context)
 
-# === ОБРАБОТКА СООБЩЕНИЙ ===
+    elif query.data == 'ad_menu':
+        keyboard = [[InlineKeyboardButton(f"{AD_TYPES[k]} — ${AD_PRICES[k]}", callback_data=k)] for k in AD_TYPES]
+        keyboard.append([InlineKeyboardButton("◀ Назад", callback_data='back_to_main')])
+        await query.edit_message_text("Выберите рекламу:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# === ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
@@ -233,7 +238,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('mode') == 'feedback':
         save_message(user.id, username, user.first_name, "Обратная связь", text)
-        await context.bot.send_message(ADMIN_CHAT_ID, f"📩 от @{username} (ID: {user.id}):\n{text}")
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"📩 от @{username} (ID: {user.id}):\n{text}"
+        )
         await update.message.reply_text("✅ Отправлено!", reply_markup=InlineKeyboardMarkup(back_button()))
         context.user_data['mode'] = None
 
@@ -242,14 +250,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ad_name = AD_TYPES[ad_key]
         ad_price = AD_PRICES[ad_key]
         save_message(user.id, username, user.first_name, "Заказ рекламы", text, ad_name, ad_price)
-        await context.bot.send_message(ADMIN_CHAT_ID, f"🛒 Заказ от @{username}:\n{ad_name}\n{text}")
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"🛒 Заказ от @{username}:\n{ad_name}\n{text}"
+        )
         await update.message.reply_text(f"✅ Заказ '{ad_name}' отправлен!", reply_markup=InlineKeyboardMarkup(back_button()))
         context.user_data['mode'] = None
 
-# === ЗАПУСК ===
+# === ЗАПУСК БОТА ===
 def main():
     if not TOKEN or not CRYPTO_BOT_TOKEN:
-        raise ValueError("Отсутствуют переменные окружения: TOKEN или CRYPTO_BOT_TOKEN")
+        raise ValueError("Отсутствуют переменные окружения: TELEGRAM_BOT_TOKEN или CRYPTO_BOT_TOKEN")
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
