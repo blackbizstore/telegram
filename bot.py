@@ -2,16 +2,15 @@ import os
 import logging
 import sqlite3
 import requests
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-# === НАСТРОЙКИ — БЕЗОПАСНО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+# === НАСТРОЙКИ — ОБЯЗАТЕЛЬНО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
 
-# === 12 ВИДОВ РЕКЛАМЫ ===
+# === РЕКЛАМА ===
 AD_PRICES = {
     "ad1": 10, "ad2": 15, "ad3": 8, "ad4": 12, "ad5": 20,
     "ad6": 25, "ad7": 18, "ad8": 14, "ad9": 16, "ad10": 11,
@@ -33,10 +32,16 @@ AD_TYPES = {
     "ad12": "Реклама в статусе"
 }
 
-# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
+# === БАЗА ===
 def init_db():
     conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            user_id INTEGER,
+            reply_to_admin BOOLEAN DEFAULT 0
+        )
+    ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +60,6 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             username TEXT,
-            ad_type TEXT,
             ad_name TEXT,
             amount REAL,
             payment_url TEXT,
@@ -68,7 +72,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# === СОХРАНЕНИЕ СООБЩЕНИЙ ===
 def save_message(user_id, username, first_name, message_type, content, ad_type=None, ad_price=None):
     conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
@@ -79,41 +82,25 @@ def save_message(user_id, username, first_name, message_type, content, ad_type=N
     conn.commit()
     conn.close()
 
-# === СОХРАНЕНИЕ ЗАКАЗОВ ===
-def save_order(user_id, username, ad_type, ad_name, amount, payment_url, invoice_id, payment_method):
+def save_order(user_id, username, ad_name, amount, payment_url, invoice_id, payment_method):
     conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO orders (user_id, username, ad_type, ad_name, amount, payment_url, invoice_id, payment_method)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, username, ad_type, ad_name, amount, payment_url, invoice_id, payment_method))
+        INSERT INTO orders (user_id, username, ad_name, amount, payment_url, invoice_id, payment_method)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, username, ad_name, amount, payment_url, invoice_id, payment_method))
     conn.commit()
     conn.close()
 
-# === ПОЛУЧЕНИЕ ИСТОРИИ ПОЛЬЗОВАТЕЛЯ ===
-def get_user_history(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT message_type, content, ad_type, ad_price, timestamp 
-        FROM messages WHERE user_id = ? ORDER BY timestamp DESC
-    ''', (user_id,))
-    return cursor.fetchall()
-
-def get_user_orders(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT ad_name, amount, payment_method, status, timestamp 
-        FROM orders WHERE user_id = ? ORDER BY timestamp DESC
-    ''', (user_id,))
-    return cursor.fetchall()
-
-# === CRYPTOBOT: СОЗДАНИЕ ИНВОЙСА ===
+# === КРИПТОБОТ ИНТЕГРАЦИЯ ===
 def create_crypto_invoice(amount, description, user_id):
+    if not CRYPTO_BOT_TOKEN or len(CRYPTO_BOT_TOKEN.strip()) < 20:
+        print("[ERROR] CRYPTO_BOT_TOKEN is empty or too short!")
+        return None, None
+
     url = "https://pay.crypt.bot/api/createInvoice"
     headers = {
-        'Crypto-Pay-API-Token': CRYPTO_BOT_TOKEN,
+        'Crypto-Pay-API-Token': CRYPTO_BOT_TOKEN.strip(),
         'Content-Type': 'application/json'
     }
     data = {
@@ -125,21 +112,19 @@ def create_crypto_invoice(amount, description, user_id):
     }
     try:
         response = requests.post(url, json=data, headers=headers, timeout=10)
+        print(f"[DEBUG] CryptoBot API response: {response.status_code} — {response.text}")
         if response.status_code == 200:
             result = response.json()
             if result.get('ok') and 'result' in result and 'pay_url' in result['result']:
                 return result['result']['invoice_id'], result['result']['pay_url']
         return None, None
     except Exception as e:
-        print(f"[ERROR] CryptoBot invoice failed: {e}")
+        print(f"[ERROR] Exception in create_crypto_invoice: {e}")
         return None, None
 
-# === КНОПКА НАЗАД ===
-def back_button(dest="main"):
-    if dest == "ad_menu":
-        return [[InlineKeyboardButton("◀ Назад", callback_data='ad_menu')]]
-    else:
-        return [[InlineKeyboardButton("◀ Назад", callback_data='back_to_main')]]
+# === УНИВЕРСАЛЬНАЯ КНОПКА НАЗАД ===
+def back_button():
+    return [[InlineKeyboardButton("◀ Назад", callback_data='back')]]
 
 # === ОСНОВНОЕ МЕНЮ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -149,30 +134,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Моя история", callback_data='history')],
         [InlineKeyboardButton("🛒 Мои заказы", callback_data='orders')]
     ]
-    text = "🚀 Привет! Выберите действие:"
+    text = "🚀 Привет! Выберите:"
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# === ОБРАБОТКА КНОПОК ===
+# === ОБРАБОТЧИК КНОПОК — С ПЕРВЫМ "BACK" ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user = query.from_user
-
-    if query.data == 'back_to_main':
+    
+    # === КНОПКА НАЗАД — СРАЗУ НАЧАЛО ===
+    if query.data == 'back':
         await start(query, context)
-        return
-    if query.data == 'ad_menu':
-        keyboard = [[InlineKeyboardButton(f"{AD_TYPES[k]} — ${AD_PRICES[k]}", callback_data=k)] for k in AD_TYPES]
-        keyboard.append([InlineKeyboardButton("◀ Назад", callback_data='back_to_main')])
-        await query.edit_message_text("Выберите рекламу:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+        return  # критически важно!
 
+    user = query.from_user
     if query.data == 'feedback':
         await query.edit_message_text("Напишите ваше сообщение:")
         context.user_data['mode'] = 'feedback'
+
+    elif query.data == 'ad_menu':
+        keyboard = [[InlineKeyboardButton(f"{AD_TYPES[k]} — ${AD_PRICES[k]}", callback_data=k)] for k in AD_TYPES]
+        keyboard.append([InlineKeyboardButton("◀ Назад", callback_data='back')])
+        await query.edit_message_text("Выберите рекламу:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif query.data in AD_TYPES:
         ad_key = query.data
@@ -181,7 +167,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("💳 Криптобот", callback_data=f'crypto_{ad_key}')],
             [InlineKeyboardButton("👤 Написать админу", callback_data=f'admin_{ad_key}')],
-            [InlineKeyboardButton("◀ Назад", callback_data='ad_menu')]
+            [InlineKeyboardButton("◀ Назад", callback_data='back')]
         ]
         await query.edit_message_text(
             f"🎯 {ad_name}\n💰 ${ad_price}",
@@ -194,58 +180,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['mode'] = f'ad_order_{ad_key}'
         await query.edit_message_text(
             f"🎯 {ad_name}\nНапишите детали заказа:",
-            reply_markup=InlineKeyboardMarkup(back_button("ad_menu"))
+            reply_markup=InlineKeyboardMarkup(back_button())
         )
 
     elif query.data.startswith('crypto_'):
         ad_key = query.data.replace('crypto_', '')
         ad_name = AD_TYPES[ad_key]
         ad_price = AD_PRICES[ad_key]
-        invoice_id, payment_url = create_crypto_invoice(ad_price, f"Реклама: {ad_name}", user.id)
+        invoice_id, payment_url = create_crypto_invoice(ad_price, f"Заказ: {ad_name}", user.id)
         if invoice_id and payment_url:
-            save_order(user.id, user.username or 'N/A', ad_key, ad_name, ad_price, payment_url, invoice_id, 'CryptoBot')
+            save_order(user.id, user.username or 'N/A', ad_name, ad_price, payment_url, invoice_id, 'CryptoBot')
             await query.edit_message_text(
-                f"✅ Счёт на ${ad_price}\n[Оплатить сейчас]({payment_url})",
+                f"✅ Счёт на ${ad_price}\n[Оплатить]({payment_url})",
                 parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(back_button("ad_menu"))
+                reply_markup=InlineKeyboardMarkup(back_button())
             )
         else:
             await query.edit_message_text(
-                "❌ Не удалось создать счёт.\nПроверьте токен CryptoBot или напишите админу.",
-                reply_markup=InlineKeyboardMarkup(back_button("ad_menu"))
+                "❌ Не удалось создать счёт.\nПроверьте токен CryptoBot и повторите.",
+                reply_markup=InlineKeyboardMarkup(back_button())
             )
 
-    elif query.data == 'history':
-        history = get_user_history(user.id)
-        msg = "📋 История сообщений:\n" + "\n".join([
-            f"• {h[0]}: {h[1][-30:]}" for h in history[:5]
-        ]) if history else "Пусто"
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(back_button()))
+    elif query.data in ('history', 'orders'):
+        await query.edit_message_text("Функция в разработке.", reply_markup=InlineKeyboardMarkup(back_button()))
 
-    elif query.data == 'orders':
-        orders = get_user_orders(user.id)
-        msg = "🛒 Мои заказы:\n" + "\n".join([
-            f"• {o[0]} — ${o[1]} ({o[2]})" for o in orders[:5]
-        ]) if orders else "Пусто"
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(back_button()))
-
-# === ОБРАТНАЯ СВЯЗЬ + ОТВЕТ АДМИНА ===
+# === ОБРАТНАЯ СВЯЗЬ С ОТВЕТОМ АДМИНА ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     username = user.username or 'N/A'
 
-    # Обратная связь
+    # === ОТВЕТ АДМИНА ПОЛЬЗОВАТЕЛЮ ===
+    if update.effective_user.id == ADMIN_CHAT_ID and update.message.reply_to_message:
+        # Извлекаем user_id из текста сообщения, на которое отвечают
+        orig_text = update.message.reply_to_message.text
+        if " (ID: " in orig_text:
+            try:
+                user_id = int(orig_text.split(" (ID: ")[1].split(")")[0])
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"💬 Админ ответил:\n\n{text}"
+                )
+                await update.message.reply_text("✅ Ответ отправлен!")
+            except:
+                await update.message.reply_text("❌ Не удалось извлечь ID пользователя.")
+        return
+
+    # === ОБРАТНАЯ СВЯЗЬ ОТ ПОЛЬЗОВАТЕЛЯ ===
     if context.user_data.get('mode') == 'feedback':
         save_message(user.id, username, user.first_name, "Обратная связь", text)
+        # Отправляем админу с указанием ID для ответа
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"📩 от @{username} (ID: {user.id}):\n{text}"
+            text=f"📩 от @{username} (ID: {user.id}):\n\n{text}"
         )
         await update.message.reply_text("✅ Отправлено!", reply_markup=InlineKeyboardMarkup(back_button()))
         context.user_data['mode'] = None
 
-    # Заказ рекламы
+    # === ЗАКАЗ РЕКЛАМЫ ===
     elif context.user_data.get('mode', '').startswith('ad_order_'):
         ad_key = context.user_data['mode'].replace('ad_order_', '')
         ad_name = AD_TYPES[ad_key]
@@ -253,7 +245,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_message(user.id, username, user.first_name, "Заказ рекламы", text, ad_name, ad_price)
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"🛒 Заказ от @{username}:\n{ad_name}\n{text}"
+            text=f"🛒 Заказ от @{username} (ID: {user.id}):\n{ad_name}\n{text}"
         )
         await update.message.reply_text(f"✅ Заказ '{ad_name}' отправлен!", reply_markup=InlineKeyboardMarkup(back_button()))
         context.user_data['mode'] = None
